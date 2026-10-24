@@ -1,347 +1,48 @@
 name: Build APK
+
 on:
   push:
     branches: [main, master]
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Generate Android project
-        run: |
-          mkdir -p "$(dirname 'app/build.gradle.kts')"
-          cat > 'app/build.gradle.kts' <<'EOF_0'
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-          }
-          android {
-              namespace = "com.liquidglass.app"
-              compileSdk = 34
-              defaultConfig {
-                  applicationId = "com.liquidglass.app"
-                  minSdk = 33
-                  targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
-              }
-              buildFeatures { compose = true }
-              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-              kotlinOptions { jvmTarget = "17" }
-          }
-          dependencies {
-              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
-              implementation("androidx.core:core-ktx:1.13.1")
-              implementation("androidx.activity:activity-compose:1.9.0")
-              implementation("androidx.compose.ui:ui")
-              implementation("androidx.compose.foundation:foundation")
-              implementation("androidx.compose.material3:material3")
-          }
-          EOF_0
-          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
-          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_1'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <application
-                  android:label="Liquid Glass"
-                  android:theme="@style/Theme.LiquidGlass">
-                  <activity android:name=".MainActivity" android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
-          EOF_1
-          mkdir -p "$(dirname 'app/src/main/java/com/liquidglass/app/GlassShader.kt')"
-          cat > 'app/src/main/java/com/liquidglass/app/GlassShader.kt' <<'EOF_2'
-          package com.liquidglass.app
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-          // AGSL liquid-glass lens: SDF rounded shape, bevel refraction, blur,
-          // chromatic aberration, tilt-driven specular rim, fresnel edge, saturation lift, soft shadow.
-          const val GLASS_AGSL = """
-          uniform shader content;
-          uniform float2 center;
-          uniform float2 halfSize;
-          uniform float radius;
-          uniform float depth;
-          uniform float refraction;
-          uniform float blurAmt;
-          uniform float aberration;
-          uniform float2 light;
-
-          float sdf(float2 p) {
-              float2 q = abs(p) - halfSize + radius;
-              return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
-          }
-
-          float4 blurTap(float2 uv) {
-              float4 acc = float4(0.0);
-              for (int i = 0; i < 8; i++) {
-                  float a = float(i) * 2.39996;
-                  float r = sqrt((float(i) + 0.5) / 8.0) * blurAmt;
-                  acc += float4(content.eval(uv + float2(cos(a), sin(a)) * r));
-              }
-              return acc / 8.0;
-          }
-
-          half4 main(float2 fc) {
-              float2 p = fc - center;
-              float d = sdf(p);
-              float3 base = float3(content.eval(fc).rgb);
-
-              // soft drop shadow, offset downward
-              float ds = max(sdf(p - float2(0.0, 10.0)), 0.0);
-              float sh = exp(-ds / 14.0) * 0.28;
-              float3 outside = base * (1.0 - sh);
-              if (d > 1.0) { return half4(half3(outside), 1.0); }
-
-              float2 e = float2(1.0, 0.0);
-              float2 gr = float2(sdf(p + e.xy) - sdf(p - e.xy), sdf(p + e.yx) - sdf(p - e.yx));
-              float gl = length(gr);
-              float2 n = gl > 1e-4 ? gr / gl : float2(0.0);
-
-              float t = clamp(-d / depth, 0.0, 1.0);
-              float edge = 1.0 - t;
-              float2 disp = n * (edge * edge) * refraction * depth * 0.8;
-
-              float cr = blurTap(fc + disp * (1.0 + aberration)).r;
-              float cg = blurTap(fc + disp).g;
-              float cb = blurTap(fc + disp * (1.0 - aberration)).b;
-              float3 col = float3(cr, cg, cb);
-
-              float luma = dot(col, float3(0.299, 0.587, 0.114));
-              col = mix(float3(luma), col, 1.3);
-              col = mix(col, float3(1.0), 0.07);
-
-              float2 L = normalize(light + float2(1e-4));
-              float nl = dot(n, L);
-              float spec = pow(abs(nl), 2.0) * pow(edge, 5.0) * (nl > 0.0 ? 1.0 : 0.55);
-              col += spec * 0.9;
-              col += pow(edge, 8.0) * 0.28;
-              col += (1.0 - t) * 0.03;
-
-              float aa = clamp(0.5 - d, 0.0, 1.0);
-              return half4(half3(mix(outside, col, aa)), 1.0);
-          }
-          """
-          EOF_2
-          mkdir -p "$(dirname 'app/src/main/java/com/liquidglass/app/MainActivity.kt')"
-          cat > 'app/src/main/java/com/liquidglass/app/MainActivity.kt' <<'EOF_3'
-          package com.liquidglass.app
-
-          import android.graphics.RenderEffect
-          import android.graphics.RuntimeShader
-          import android.hardware.Sensor
-          import android.hardware.SensorEvent
-          import android.hardware.SensorEventListener
-          import android.hardware.SensorManager
-          import android.os.Bundle
-          import androidx.activity.ComponentActivity
-          import androidx.activity.compose.setContent
-          import androidx.compose.foundation.Canvas
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.gestures.detectDragGestures
-          import androidx.compose.foundation.layout.Box
-          import androidx.compose.foundation.layout.Column
-          import androidx.compose.foundation.layout.fillMaxSize
-          import androidx.compose.foundation.layout.fillMaxWidth
-          import androidx.compose.foundation.layout.navigationBarsPadding
-          import androidx.compose.foundation.layout.padding
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.material3.Slider
-          import androidx.compose.material3.Text
-          import androidx.compose.runtime.Composable
-          import androidx.compose.runtime.State
-          import androidx.compose.runtime.getValue
-          import androidx.compose.runtime.mutableFloatStateOf
-          import androidx.compose.runtime.mutableStateOf
-          import androidx.compose.runtime.remember
-          import androidx.compose.runtime.setValue
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.geometry.Offset
-          import androidx.compose.ui.graphics.Brush
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.graphics.asComposeRenderEffect
-          import androidx.compose.ui.graphics.graphicsLayer
-          import androidx.compose.ui.input.pointer.pointerInput
-          import androidx.compose.ui.layout.onSizeChanged
-          import androidx.compose.ui.platform.LocalDensity
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.unit.IntSize
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-
-          class MainActivity : ComponentActivity(), SensorEventListener {
-              private val tilt = mutableStateOf(Offset(-0.5f, -0.85f))
-              private lateinit var sm: SensorManager
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  sm = getSystemService(SENSOR_SERVICE) as SensorManager
-                  setContent { GlassDemo(tilt) }
-              }
-
-              override fun onResume() {
-                  super.onResume()
-                  sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
-                      sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-                  }
-              }
-
-              override fun onPause() {
-                  super.onPause()
-                  sm.unregisterListener(this)
-              }
-
-              override fun onSensorChanged(e: SensorEvent) {
-                  val target = Offset(-e.values[0] / 9.81f, -e.values[1] / 9.81f)
-                  val cur = tilt.value
-                  tilt.value = Offset(cur.x + (target.x - cur.x) * 0.12f, cur.y + (target.y - cur.y) * 0.12f)
-              }
-
-              override fun onAccuracyChanged(s: Sensor?, a: Int) {}
-          }
-
-          @Composable
-          fun Scene() {
-              Box(
-                  Modifier.fillMaxSize().background(
-                      Brush.linearGradient(listOf(Color(0xFF1B1464), Color(0xFFC72C7B), Color(0xFFFF9E40)))
-                  )
-              ) {
-                  Canvas(Modifier.fillMaxSize()) {
-                      val w = size.width
-                      val h = size.height
-                      drawCircle(Color(0xFF00E5FF), w * 0.28f, Offset(w * 0.2f, h * 0.2f))
-                      drawCircle(Color(0xFFFFEB3B), w * 0.22f, Offset(w * 0.85f, h * 0.35f))
-                      drawCircle(Color(0xFF76FF03), w * 0.25f, Offset(w * 0.3f, h * 0.7f))
-                      val line = Color.White.copy(alpha = 0.3f)
-                      var x = 0f
-                      while (x < w) { drawLine(line, Offset(x, 0f), Offset(x, h), 2f); x += w / 12f }
-                      var y = 0f
-                      while (y < h) { drawLine(line, Offset(0f, y), Offset(w, y), 2f); y += w / 12f }
-                  }
-                  Column(Modifier.fillMaxSize().padding(top = 90.dp, start = 24.dp)) {
-                      repeat(7) {
-                          Text("LIQUID GLASS", fontSize = 44.sp, fontWeight = FontWeight.Black,
-                              color = Color.White.copy(alpha = 0.92f))
-                      }
-                  }
-              }
-          }
-
-          @Composable
-          fun GlassDemo(light: State<Offset>) {
-              val density = LocalDensity.current.density
-              var size by remember { mutableStateOf(IntSize.Zero) }
-              var center by remember { mutableStateOf(Offset.Unspecified) }
-              var refraction by remember { mutableFloatStateOf(0.7f) }
-              var blur by remember { mutableFloatStateOf(0.35f) }
-              var aberration by remember { mutableFloatStateOf(0.12f) }
-              var scale by remember { mutableFloatStateOf(1f) }
-              val shader = remember { RuntimeShader(GLASS_AGSL) }
-
-              Box(
-                  Modifier.fillMaxSize()
-                      .onSizeChanged {
-                          size = it
-                          if (!center.isSpecified) center = Offset(it.width / 2f, it.height * 0.38f)
-                      }
-                      .pointerInput(Unit) {
-                          detectDragGestures { change, drag ->
-                              change.consume()
-                              if (center.isSpecified) center += drag
-                          }
-                      }
-              ) {
-                  Box(Modifier.fillMaxSize().graphicsLayer {
-                      if (center.isSpecified && size.width > 0) {
-                          val halfW = 150f * density * scale
-                          val halfH = 62f * density * scale
-                          val l = light.value
-                          shader.setFloatUniform("center", center.x, center.y)
-                          shader.setFloatUniform("halfSize", halfW, halfH)
-                          shader.setFloatUniform("radius", halfH)
-                          shader.setFloatUniform("depth", halfH * 0.9f)
-                          shader.setFloatUniform("refraction", refraction)
-                          shader.setFloatUniform("blurAmt", blur * 8f * density)
-                          shader.setFloatUniform("aberration", aberration)
-                          shader.setFloatUniform("light", l.x, l.y)
-                          renderEffect = RenderEffect.createRuntimeShaderEffect(shader, "content")
-                              .asComposeRenderEffect()
-                      }
-                  }) { Scene() }
-
-                  Column(
-                      Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
-                          .padding(16.dp).fillMaxWidth()
-                          .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(24.dp))
-                          .padding(16.dp)
-                  ) {
-                      Text("Drag the glass around", color = Color.White, fontSize = 13.sp)
-                      Text("Refraction", color = Color.White, fontSize = 12.sp)
-                      Slider(refraction, { refraction = it }, valueRange = 0f..1.5f)
-                      Text("Blur", color = Color.White, fontSize = 12.sp)
-                      Slider(blur, { blur = it })
-                      Text("Chromatic aberration", color = Color.White, fontSize = 12.sp)
-                      Slider(aberration, { aberration = it }, valueRange = 0f..0.5f)
-                      Text("Size", color = Color.White, fontSize = 12.sp)
-                      Slider(scale, { scale = it }, valueRange = 0.5f..1.6f)
-                  }
-              }
-          }
-          EOF_3
-          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
-          cat > 'app/src/main/res/values/themes.xml' <<'EOF_4'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <style name="Theme.LiquidGlass" parent="android:Theme.Material.Light.NoActionBar">
-                  <item name="android:statusBarColor">@android:color/transparent</item>
-                  <item name="android:navigationBarColor">@android:color/transparent</item>
-              </style>
-          </resources>
-          EOF_4
-          mkdir -p "$(dirname 'build.gradle.kts')"
-          cat > 'build.gradle.kts' <<'EOF_5'
-          plugins {
-              id("com.android.application") version "8.5.2" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-          }
-          EOF_5
-          mkdir -p "$(dirname 'gradle.properties')"
-          cat > 'gradle.properties' <<'EOF_6'
-          android.useAndroidX=true
-          org.gradle.jvmargs=-Xmx3g
-          EOF_6
-          mkdir -p "$(dirname 'settings.gradle.kts')"
-          cat > 'settings.gradle.kts' <<'EOF_7'
-          pluginManagement {
-              repositories { google(); mavenCentral(); gradlePluginPortal() }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories { google(); mavenCentral() }
-          }
-          rootProject.name = "LiquidGlass"
-          include(":app")
-          EOF_7
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
-      - name: Build
-        run: gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
+          gradle-version: "8.9"
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Run unit tests
+        run: gradle --no-daemon :app:testDebugUnitTest
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
         with:
-          name: LiquidGlass-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: liquidandroid-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
